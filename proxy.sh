@@ -6,79 +6,83 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-# 路径定义
-CONFIG_FILE="/etc/xray/config.json"
-CERT_PATH="/etc/xray/certs/server.crt"
-KEY_PATH="/etc/xray/certs/server.key"
-LOG_FILE="/var/log/xray/access.log"
-ERROR_LOG="/var/log/xray/error.log"
+# 核心定义：只允许 xray 名字存在
+EXEC_NAME="xray"
+BIN_PATH="/usr/local/bin/$EXEC_NAME"
+CONF_DIR="/etc/$EXEC_NAME"
+CONF_FILE="$CONF_DIR/config.json"
+LOG_DIR="/var/log/$EXEC_NAME"
+ERROR_LOG="$LOG_DIR/error.log"
+CERT_PATH="$CONF_DIR/server.crt"
+KEY_PATH="$CONF_DIR/server.key"
 
-# 检查权限
-[[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 权限运行此脚本！${NC}" && exit 1
+[[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 权限运行！${NC}" && exit 1
 
 # 快捷命令设置
 install_shortcut() {
-    if [[ ! -f "/usr/local/bin/proxy" ]]; then
-        ln -sf "$(readlink -f "$0")" /usr/local/bin/proxy
-        chmod +x /usr/local/bin/proxy
-    fi
+    [[ -L "/usr/local/bin/proxy" ]] && rm -f /usr/local/bin/proxy
+    ln -sf "$(readlink -f "$0")" /usr/local/bin/proxy
+    chmod +x /usr/local/bin/proxy
 }
 
-# 获取当前配置并生成链接
+# 自动拼接 VLESS 链接
 get_link() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo -e "${RED}错误：未检测到配置文件，请先安装代理。${NC}"
+    if [[ ! -f "$CONF_FILE" ]]; then
+        echo -e "${RED}未检测到配置。${NC}"
         return
     fi
-    UUID=$(jq -r '.inbounds[0].settings.clients[0].id' $CONFIG_FILE)
-    PORT=$(jq -r '.inbounds[0].port' $CONFIG_FILE)
-    SERVICE_NAME=$(jq -r '.inbounds[0].streamSettings.grpcSettings.serviceName' $CONFIG_FILE)
-    DOMAIN=$(grep -oP '(?<=SNI: ).*' /etc/xray/domain_record.txt 2>/dev/null || echo "您的域名")
-
-    LINK="vless://${UUID}@${DOMAIN}:${PORT}?security=tls&encryption=none&type=grpc&serviceName=${SERVICE_NAME}&sni=${DOMAIN}#CF_VLESS_gRPC"
+    UUID=$(jq -r '.inbounds[0].settings.clients[0].id' $CONF_FILE)
+    DOMAIN=$(cat $CONF_DIR/domain_record.txt 2>/dev/null)
     
-    echo -e "${GREEN}=== 当前代理连接信息 ===${NC}"
-    echo -e "${YELLOW}域名:${NC} $DOMAIN"
-    echo -e "${YELLOW}UUID:${NC} $UUID"
-    echo -e "${YELLOW}传输:${NC} gRPC (Service Name: $SERVICE_NAME)"
-    echo -e "----------------------------------"
-    echo -e "${GREEN}VLESS 节点链接:${NC}"
+    LINK="vless://${UUID}@${DOMAIN}:2083?security=tls&encryption=none&type=grpc&serviceName=grpc-proxy&sni=${DOMAIN}#CF_VLESS_gRPC"
+    
+    echo -e "${GREEN}=== VLESS 节点链接 ===${NC}"
     echo -e "${RED}${LINK}${NC}"
-    echo -e "----------------------------------"
+    echo -e "${YELLOW}重要：请前往 CF 控制台 -> 网络 -> 开启 gRPC 开关！${NC}"
+    echo -e "${YELLOW}重要：SSL/TLS 必须设为 Full (Strict)！${NC}"
 }
 
-# 1. 安装功能
+# 安装功能
 install_proxy() {
-    echo -e "${GREEN}正在安装基础依赖...${NC}"
-    apt update && apt install -y curl socat wget jq openssl
+    echo -e "${GREEN}正在清理旧环境并安装依赖...${NC}"
+    apt update && apt install -y curl jq openssl wget
     
-    read -p "请输入你的域名 (例如 example.com): " DOMAIN
-    echo -e "${YELLOW}请粘贴 Cloudflare 根源证书 (Origin Certificate)，按 Ctrl+D 保存:${NC}"
+    # 交互输入
+    read -p "请输入域名: " DOMAIN
+    echo -e "${YELLOW}请粘贴 CF 根源证书，按 Ctrl+D 保存:${NC}"
     CERT_CONTENT=$(cat)
-    echo -e "${YELLOW}请粘贴 Cloudflare 私钥 (Private Key)，按 Ctrl+D 保存:${NC}"
+    echo -e "${YELLOW}请粘贴 CF 私钥，按 Ctrl+D 保存:${NC}"
     KEY_CONTENT=$(cat)
     
-    mkdir -p /etc/xray/certs /var/log/xray
+    # 创建纯净目录
+    mkdir -p $CONF_DIR $LOG_DIR
     echo "$CERT_CONTENT" > $CERT_PATH
     echo "$KEY_CONTENT" > $KEY_PATH
-    echo "SNI: $DOMAIN" > /etc/xray/domain_record.txt
-    
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    
+    echo "$DOMAIN" > $CONF_DIR/domain_record.txt
+    touch $ERROR_LOG
+
+    # 下载 Xray 核心并重命名（不使用官方脚本以保证纯净度）
+    PLATFORM="64"
+    [[ $(uname -m) == "aarch64" ]] && PLATFORM="arm64-v8a"
+    TAG=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+    wget -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-linux-${PLATFORM}.zip"
+    apt install -y unzip && unzip -o /tmp/xray.zip -d /tmp/xray_bin
+    cp /tmp/xray_bin/xray $BIN_PATH
+    chmod +x $BIN_PATH
+    rm -rf /tmp/xray.zip /tmp/xray_bin
+
+    # 生成 UUID
     UUID=$(cat /proc/sys/kernel/random/uuid)
-    # 配置中 loglevel 设为 warning，只记录错误信息
-    cat <<EOF > $CONFIG_FILE
+    
+    # 写入配置 (仅保留错误日志，loglevel=warning)
+    cat <<EOF > $CONF_FILE
 {
-    "log": {
-        "access": "$LOG_FILE",
-        "error": "$ERROR_LOG",
-        "loglevel": "warning"
-    },
+    "log": { "error": "$ERROR_LOG", "loglevel": "warning" },
     "dns": { "servers": ["https://1.1.1.1/dns-query"] },
     "inbounds": [{
         "port": 2083,
         "protocol": "vless",
-        "settings": { "clients": [{"id": "$UUID", "level": 0}], "decryption": "none" },
+        "settings": { "clients": [{"id": "$UUID"}], "decryption": "none" },
         "streamSettings": {
             "network": "grpc",
             "security": "tls",
@@ -92,94 +96,71 @@ install_proxy() {
     "outbounds": [{"protocol": "freedom"}]
 }
 EOF
-    touch $LOG_FILE $ERROR_LOG
-    chown -R nobody:nogroup /var/log/xray
+
+    # 创建自定义 Systemd 服务，服务名只叫 xray
+    cat <<EOF > /etc/systemd/system/xray.service
+[Unit]
+Description=xray
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=$BIN_PATH run -c $CONF_FILE
+Restart=on-failure
+RestartPreventExitStatus=23
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
     systemctl restart xray
     systemctl enable xray
-    clear
-    echo -e "${GREEN}安装完成！日志级别已设为 warning。${NC}"
+    
+    echo -e "${GREEN}安装完成！进程名与服务名均为: xray${NC}"
     get_link
 }
 
-# 2. 日志管理
-view_log() {
-    echo -e "${YELLOW}正在实时查看错误日志 (按 Ctrl+C 退出):${NC}"
-    tail -f $ERROR_LOG
-}
-
-clear_log() {
-    > $LOG_FILE
-    > $ERROR_LOG
-    echo -e "${GREEN}代理日志已清空。${NC}"
-}
-
-# 3. 基础设置更改
-change_domain() {
-    read -p "请输入新的域名: " NEW_DOMAIN
-    echo "SNI: $NEW_DOMAIN" > /etc/xray/domain_record.txt
-    echo -e "${GREEN}域名记录已更新。${NC}"
-}
-
-change_certs() {
-    echo -e "${YELLOW}请粘贴新的证书，按 Ctrl+D 结束:${NC}"
-    NEW_CERT=$(cat)
-    echo -e "${YELLOW}请粘贴新的私钥，按 Ctrl+D 结束:${NC}"
-    NEW_KEY=$(cat)
-    echo "$NEW_CERT" > $CERT_PATH
-    echo "$NEW_KEY" > $KEY_PATH
-    systemctl restart xray
-    echo -e "${GREEN}证书已更新。${NC}"
-}
-
-change_dns() {
-    read -p "请输入新的 DoH 地址: " NEW_DNS
-    jq ".dns.servers[0] = \"$NEW_DNS\"" $CONFIG_FILE > /tmp/xray.json && mv /tmp/xray.json $CONFIG_FILE
-    systemctl restart xray
-    echo -e "${GREEN}DNS 已更新。${NC}"
-}
-
-# 4. 卸载
-uninstall_proxy() {
-    read -p "确定卸载吗？(y/n): " CONFIRM
-    if [[ "$CONFIRM" == "y" ]]; then
-        systemctl stop xray
-        rm -rf /etc/xray /var/log/xray /usr/local/bin/xray /usr/local/bin/proxy
-        echo -e "${RED}已彻底卸载。${NC}"
-        exit 0
-    fi
-}
-
-# 主菜单
+# 菜单
 show_menu() {
     install_shortcut
-    echo -e "${GREEN}=== Debian 12 VLESS+CF 管理脚本 ===${NC}"
-    echo -e "1. 一键安装代理 (VLESS+gRPC+2083)"
-    echo -e "2. 查看代理连接 (分享链接)"
-    echo -e "3. 更改域名 / 证书 / DNS"
-    echo -e "----------------------------------"
-    echo -e "4. ${YELLOW}实时查看错误日志${NC}"
-    echo -e "5. ${YELLOW}清空代理日志${NC}"
-    echo -e "----------------------------------"
-    echo -e "6. ${RED}卸载代理${NC}"
+    clear
+    echo -e "${GREEN}=== Debian 12 VLESS ($EXEC_NAME) 管理 ===${NC}"
+    echo -e "1. 安装代理"
+    echo -e "2. 查看连接链接"
+    echo -e "3. 更改域名"
+    echo -e "4. 更改 CF 证书"
+    echo -e "5. 更改 DoH DNS"
+    echo -e "6. 查看错误日志"
+    echo -e "7. 清空日志"
+    echo -e "8. ${RED}彻底卸载${NC}"
     echo -e "0. 退出"
-    echo -e "----------------------------------"
     read -p "请选择: " OPT
     case $OPT in
         1) install_proxy ;;
         2) get_link ;;
-        3) 
-           echo "1.更改域名 2.更改证书 3.更改DNS"
-           read -p "选择: " SUB_OPT
-           [[ $SUB_OPT == 1 ]] && change_domain
-           [[ $SUB_OPT == 2 ]] && change_certs
-           [[ $SUB_OPT == 3 ]] && change_dns
-           ;;
-        4) view_log ;;
-        5) clear_log ;;
-        6) uninstall_proxy ;;
+        3) read -p "新域名: " D; echo "$D" > $CONF_DIR/domain_record.txt; echo "已更新";;
+        4) 
+            echo "请粘贴新证书(Ctrl+D):"; C=$(cat); echo "$C" > $CERT_PATH
+            echo "请粘贴新私钥(Ctrl+D):"; K=$(cat); echo "$K" > $KEY_PATH
+            systemctl restart xray && echo "已重启";;
+        5) 
+            read -p "新 DoH: " DNS
+            jq ".dns.servers[0] = \"$DNS\"" $CONF_FILE > /tmp/x.json && mv /tmp/x.json $CONF_FILE
+            systemctl restart xray && echo "已更新";;
+        6) tail -f $ERROR_LOG ;;
+        7) > $ERROR_LOG && echo "已清空";;
+        8) 
+            systemctl stop xray && systemctl disable xray
+            rm -f /etc/systemd/system/xray.service /usr/local/bin/xray /usr/local/bin/proxy
+            rm -rf $CONF_DIR $LOG_DIR
+            echo "已彻底清除所有痕迹"; exit 0;;
         0) exit 0 ;;
-        *) echo "无效输入"; sleep 1; show_menu ;;
+        *) show_menu ;;
     esac
 }
 
-while true; do show_menu; done
+show_menu
