@@ -1,84 +1,86 @@
 #!/usr/bin/env bash
 
 # =====================================================
-# ArgoX Integrated & Fixed Edition
-# Version: 1.6.16 (2025.12.16)
+# ArgoX Integrated Edition (Auto-Clean & Fix)
+# Version: 1.6.18 (2025.12.16)
 # =====================================================
 
-VERSION='1.6.16'
+VERSION='1.6.18'
 WORK_DIR='/etc/argox'
-TEMP_DIR='/tmp/argox'
-WS_PATH_DEFAULT='argox'
+BIN_PATH='/usr/local/bin/argox'
 NGINX_PORT='80'
 XRAY_PORT='8080'
 METRICS_PORT='3333'
 DEFAULT_XRAY_VERSION='26.2.6'
-CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "cfip.xxxxxxxx.tk" "bestcf.top" "cdn.2020111.xyz" "xn--b6gac.eu.org" "cf.090227.xyz")
+CDN_DOMAIN=("skk.moe" "ip.sb" "time.is" "bestcf.top" "cf.090227.xyz")
 
-export DEBIAN_FRONTEND=noninteractive
-mkdir -p "$TEMP_DIR" "$WORK_DIR"
-
-# ==========================
-# 多语言提示词字典
-# ==========================
-E[10]="(3/8) Please enter Argo Domain (Leave blank for temporary tunnel):"
-C[10]="(3/8) 请输入 Argo 域名 (留空则使用临时隧道):"
-E[11]="Please enter Argo Token/Json/API content:"
-C[11]="请输入 Argo Token/Json/API 认证内容:"
-E[42]="(5/8) Preferred CDN Domain [Default: ${CDN_DOMAIN[0]}]:"
-C[42]="(5/8) 优选域名 [默认: ${CDN_DOMAIN[0]}]:"
-E[68]="(1/8) Install Nginx for FakeSite? [y/n, Default: y]:"
-C[68]="(1/8) 是否安装 Nginx 伪装站? [y/n, 默认: y]:"
-
-warning(){ echo -e "\033[31m\033[01m$*\033[0m"; }
-error(){ echo -e "\033[31m\033[01m$*\033[0m"; exit 1; }
+# 彩色输出
 info(){ echo -e "\033[32m\033[01m$*\033[0m"; }
-hint(){ echo -e "\033[33m\033[01m$*\033[0m"; }
-reading(){ read -rp "$(info "$1")" "$2"; }
-[[ "$LANG" =~ "zh" ]] && L="C" || L="E"
-text() { eval echo "\${$L[$1]}"; }
+warning(){ echo -e "\033[31m\033[01m$*\033[0m"; }
+reading(){ read -rp "$(echo -e "\033[32m\033[01m$1\033[0m")" "$2"; }
 
-# ==========================
-# 系统环境检测
-# ==========================
+# 1. 自动删除已有隧道和残留
+clean_old_install(){
+    info "正在清理旧的安装环境，防止冲突..."
+    systemctl stop argo xray nginx 2>/dev/null
+    systemctl disable argo xray nginx 2>/dev/null
+    rm -f /etc/systemd/system/argo.service
+    rm -f /etc/systemd/system/xray.service
+    systemctl daemon-reload
+    # 彻底清除旧文件，确保重新下载
+    rm -rf "$WORK_DIR"
+    mkdir -p "$WORK_DIR"
+}
+
+# 2. 系统检测与环境准备
 check_env(){
-  [ "$(id -u)" != 0 ] && error "必须使用 root 运行"
-  [ -f /etc/os-release ] && . /etc/os-release
-  [[ "$NAME" =~ "Alpine" ]] && SYSTEM="Alpine" || SYSTEM="Linux"
-  
-  case $(uname -m) in
-    x86_64|amd64) ARGO_ARCH=amd64; XRAY_ARCH=64 ;;
-    aarch64|arm64) ARGO_ARCH=arm64; XRAY_ARCH=arm64-v8a ;;
-    *) error "架构不支持" ;;
-  esac
-  
-  if [ "$SYSTEM" = "Alpine" ]; then
-    ARGO_SVC='/etc/init.d/argo'; XRAY_SVC='/etc/init.d/xray'
-  else
-    ARGO_SVC='/etc/systemd/system/argo.service'; XRAY_SVC='/etc/systemd/system/xray.service'
-  fi
+    [ "$(id -u)" != 0 ] && { warning "请使用 root 运行"; exit 1; }
+    case $(uname -m) in
+        x86_64|amd64) ARGO_ARCH=amd64; XRAY_ARCH=64 ;;
+        aarch64|arm64) ARGO_ARCH=arm64; XRAY_ARCH=arm64-v8a ;;
+        *) warning "不支持的架构"; exit 1 ;;
+    esac
+    apt update -y && apt install -y wget curl unzip nginx 2>/dev/null || apk add wget curl unzip nginx 2>/dev/null
 }
 
-# ==========================
-# 组件下载与配置
-# ==========================
+# 3. 组件下载
 download_components(){
-  info "正在下载核心组件..."
-  # Cloudflared
-  wget -qO "$WORK_DIR/cloudflared" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARGO_ARCH"
-  chmod +x "$WORK_DIR/cloudflared"
-  
-  # Xray
-  wget -qO "$TEMP_DIR/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/v$DEFAULT_XRAY_VERSION/Xray-linux-$XRAY_ARCH.zip"
-  apt install unzip -y || apk add unzip
-  unzip -oj "$TEMP_DIR/xray.zip" "xray" -d "$WORK_DIR"
-  chmod +x "$WORK_DIR/xray"
+    info "正在拉取核心组件 (Cloudflared & Xray)..."
+    wget -qO "$WORK_DIR/cloudflared" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARGO_ARCH"
+    chmod +x "$WORK_DIR/cloudflared"
+    
+    wget -qO "$WORK_DIR/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/v$DEFAULT_XRAY_VERSION/Xray-linux-$XRAY_ARCH.zip"
+    unzip -oj "$WORK_DIR/xray.zip" "xray" -d "$WORK_DIR"
+    chmod +x "$WORK_DIR/xray"
+    rm -f "$WORK_DIR/xray.zip"
 }
 
-setup_nginx() {
-  info "配置 Nginx..."
-  [ "$SYSTEM" = "Alpine" ] && apk add nginx || apt install nginx -y
-  cat > "$WORK_DIR/nginx.conf" <<EOF
+# 4. 核心安装逻辑
+install_argox(){
+    clean_old_install
+    check_env
+    
+    # --- 交互提示部分 (解决你提到的提示缺失问题) ---
+    info "--- 基础配置 ---"
+    reading "请输入 Argo 域名 (留空则使用临时隧道): " ARGO_DOMAIN
+    if [ -n "$ARGO_DOMAIN" ]; then
+        reading "请输入 Argo Token 或 Json 内容: " ARGO_AUTH
+    fi
+    
+    reading "请输入优选域名 [默认: ${CDN_DOMAIN[0]}]: " SERVER
+    SERVER=${SERVER:-${CDN_DOMAIN[0]}}
+    
+    UUID_DEFAULT=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "550e8400-e29b-41d4-a716-446655440000")
+    reading "请输入 UUID [默认: $UUID_DEFAULT]: " UUID
+    UUID=${UUID:-$UUID_DEFAULT}
+    
+    reading "请输入 WS 路径 [默认: argox]: " WS_PATH
+    WS_PATH=${WS_PATH:-"argox"}
+
+    download_components
+
+    # 生成 Nginx 配置 (伪装站 + WS 转发)
+    cat > "$WORK_DIR/nginx.conf" <<EOF
 user root;
 worker_processes auto;
 events { worker_connections 1024; }
@@ -98,32 +100,9 @@ http {
     }
 }
 EOF
-}
 
-# ==========================
-# 安装主逻辑
-# ==========================
-install_argox(){
-  check_env
-  
-  # 交互输入
-  reading "$(text 68) " IS_NGINX
-  reading "$(text 10) " ARGO_DOMAIN
-  [ -n "$ARGO_DOMAIN" ] && reading "$(text 11) " ARGO_AUTH
-  reading "$(text 42) " SERVER
-  SERVER=${SERVER:-${CDN_DOMAIN[0]}}
-  
-  UUID_DEFAULT=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "550e8400-e29b-41d4-a716-446655440000")
-  reading "请输入 UUID [$UUID_DEFAULT]: " UUID
-  UUID=${UUID:-$UUID_DEFAULT}
-  reading "请输入 WS 路径 [$WS_PATH_DEFAULT]: " WS_PATH
-  WS_PATH=${WS_PATH:-$WS_PATH_DEFAULT}
-
-  download_components
-  [ "${IS_NGINX,,}" != "n" ] && setup_nginx
-
-  # 生成 Xray 配置
-  cat > "$WORK_DIR/config.json" <<EOF
+    # 生成 Xray 配置
+    cat > "$WORK_DIR/config.json" <<EOF
 {
     "inbounds": [{
         "port": $XRAY_PORT, "listen": "127.0.0.1", "protocol": "vless",
@@ -134,32 +113,35 @@ install_argox(){
 }
 EOF
 
-  # 写入服务并启动
-  if [ -z "$ARGO_DOMAIN" ]; then
-    ARGO_RUN="$WORK_DIR/cloudflared tunnel --url http://localhost:$NGINX_PORT --no-autoupdate --metrics localhost:$METRICS_PORT"
-  else
-    if [[ "$ARGO_AUTH" =~ "token" ]]; then
-      ARGO_RUN="$WORK_DIR/cloudflared tunnel --no-autoupdate run --token $ARGO_AUTH"
+    # --- 确定 Argo 启动参数 (修复临时隧道失败和固定隧道冲突) ---
+    if [ -z "$ARGO_DOMAIN" ]; then
+        # 临时隧道专用
+        ARGO_ARGS="tunnel --url http://localhost:$NGINX_PORT --no-autoupdate --metrics localhost:$METRICS_PORT"
+    elif [[ "$ARGO_AUTH" =~ "eyJh" ]]; then
+        # Token 模式
+        ARGO_ARGS="tunnel --no-autoupdate run --token $ARGO_AUTH"
     else
-      echo "$ARGO_AUTH" > "$WORK_DIR/argo.json"
-      ARGO_RUN="$WORK_DIR/cloudflared tunnel --no-autoupdate --origincert $WORK_DIR/argo.json run $ARGO_DOMAIN"
+        # Json 证书模式
+        echo "$ARGO_AUTH" > "$WORK_DIR/argo.json"
+        ARGO_ARGS="tunnel --no-autoupdate --cred-file $WORK_DIR/argo.json run $ARGO_DOMAIN"
     fi
-  fi
 
-  if [ "$SYSTEM" != "Alpine" ]; then
-    cat > "$ARGO_SVC" <<EOF
+    # 写入并启动 Systemd 服务
+    cat > /etc/systemd/system/argo.service <<EOF
 [Unit]
 Description=Argo Tunnel
 After=network.target
 [Service]
-ExecStart=$ARGO_RUN
+ExecStart=$WORK_DIR/cloudflared $ARGO_ARGS
 Restart=always
+RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-    cat > "$XRAY_SVC" <<EOF
+
+    cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
-Description=Xray
+Description=Xray Service
 After=network.target
 [Service]
 ExecStart=$WORK_DIR/xray -config $WORK_DIR/config.json
@@ -167,46 +149,39 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    cp "$WORK_DIR/nginx.conf" /etc/nginx/nginx.conf
     systemctl daemon-reload
-    systemctl enable --now argo xray
-    [ "${IS_NGINX,,}" != "n" ] && { cp "$WORK_DIR/nginx.conf" /etc/nginx/nginx.conf; systemctl restart nginx; }
-  fi
-
-  # 建立快捷命令
-  ln -sf "$(realpath "$0")" /usr/local/bin/argox
-  chmod +x /usr/local/bin/argox
-
-  # 获取并展示信息
-  show_node_info
+    systemctl restart nginx xray
+    systemctl enable --now argo
+    
+    # 建立快捷命令
+    ln -sf "$(realpath "$0")" "$BIN_PATH"
+    chmod +x "$BIN_PATH"
+    
+    show_node_info "$ARGO_DOMAIN" "$UUID" "$WS_PATH" "$SERVER"
 }
 
 show_node_info(){
-  if [ -z "$ARGO_DOMAIN" ]; then
-    info "正在等待临时域名生成..."
-    sleep 10
-    ARGO_DOMAIN=$(curl -s http://localhost:$METRICS_PORT/metrics | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | head -n 1)
-  fi
-  
-  clear
-  info "========= ArgoX 安装完成 ========="
-  echo "域名: $ARGO_DOMAIN"
-  echo "UUID: $UUID"
-  echo "路径: /$WS_PATH"
-  echo "优选域名: $SERVER"
-  echo "--------------------------------"
-  hint "VLESS 链接:"
-  echo "vless://$UUID@$SERVER:443?encryption=none&security=tls&sni=$ARGO_DOMAIN&type=ws&host=$ARGO_DOMAIN&path=%2F$WS_PATH#ArgoX_$(hostname)"
-  info "================================"
+    local domain=$1; local uuid=$2; local path=$3; local server=$4
+    if [ -z "$domain" ]; then
+        info "正在获取临时隧道域名 (约10秒)..."
+        sleep 10
+        domain=$(curl -s http://localhost:$METRICS_PORT/metrics | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | head -n 1)
+    fi
+    clear
+    info "=========================================="
+    info "         ArgoX 安装部署成功"
+    info "=========================================="
+    echo "域名: $domain"
+    echo "UUID: $uuid"
+    echo "路径: /$path"
+    echo "优选: $server"
+    echo "------------------------------------------"
+    info "VLESS 链接:"
+    echo "vless://$uuid@$server:443?encryption=none&security=tls&sni=$domain&type=ws&host=$domain&path=%2F$path#ArgoX_$(hostname)"
+    info "=========================================="
 }
 
-# 简单菜单
-clear
-echo "1. 安装/修复 ArgoX"
-echo "2. 查看节点信息"
-echo "0. 退出"
-read -p "请选择: " opt
-case $opt in
-  1) install_argox ;;
-  2) show_node_info ;;
-  *) exit ;;
-esac
+# 运行
+install_argox
