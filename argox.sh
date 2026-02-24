@@ -7,7 +7,7 @@ export ARGOSERIAL=1
 safe_run() {
     "$@"
     sync
-    sleep 0.5
+    sleep 1
 }
 # =========================
 # 当前脚本版本号
