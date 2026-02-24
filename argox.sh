@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ===== LXC SAFE MODE =====
-ulimit -u 60
+ulimit -u 50
 ulimit -n 1024
 export ARGOSERIAL=1
 
 safe_run() {
     "$@"
     sync
-    sleep 0.3
+    sleep 0.5
 }
 # =========================
 # 当前脚本版本号
