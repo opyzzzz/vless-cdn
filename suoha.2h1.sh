@@ -2,7 +2,7 @@
 set -e
 set -o pipefail
 
-VERSION="2.5-双协议可切换增强版"
+VERSION="2.7-自动清理+智能切换版"
 
 BASE_DIR="/opt/suoha"
 BIN_DIR="$BASE_DIR/bin"
@@ -11,6 +11,7 @@ SYSTEMD_DIR="/etc/systemd/system"
 CF_PREFERRED_DOMAIN="cloudflare.182682.xyz"
 ARCH=$(uname -m)
 
+#####################################
 检测系统() {
     source /etc/os-release
     OS=$ID
@@ -41,10 +42,9 @@ ARCH=$(uname -m)
             exit 1
         ;;
     esac
-
-    echo "检测到系统: $OS"
 }
 
+#####################################
 检测架构() {
     case "$ARCH" in
         x86_64|amd64) echo "64" ;;
@@ -53,38 +53,67 @@ ARCH=$(uname -m)
     esac
 }
 
+#####################################
 检测IP协议() {
-    echo "检测 IPv4..."
     curl -4 -s --max-time 3 https://speed.cloudflare.com/meta >/dev/null && IPV4=1 || IPV4=0
-
-    echo "检测 IPv6..."
     curl -6 -s --max-time 3 https://speed.cloudflare.com/meta >/dev/null && IPV6=1 || IPV6=0
 
     if [ "$IPV4" = "0" ] && [ "$IPV6" = "0" ]; then
-        echo "IPv4 与 IPv6 均不可用"
+        echo "IPv4 和 IPv6 均不可用"
         exit 1
     fi
 
-    echo "请选择网络协议："
+    echo "选择网络协议："
     [ "$IPV4" = "1" ] && echo "1. IPv4"
     [ "$IPV6" = "1" ] && echo "2. IPv6"
     read -p "选择: " IP_CHOICE
 
     if [ "$IP_CHOICE" = "1" ]; then
         EDGE_IP_VERSION=4
-    elif [ "$IP_CHOICE" = "2" ]; then
-        EDGE_IP_VERSION=6
     else
-        echo "选择错误"
+        EDGE_IP_VERSION=6
+    fi
+}
+
+#####################################
+提取Token() {
+    read -p "请粘贴 Tunnel 命令或 Token: " INPUT_TOKEN
+
+    if [[ "$INPUT_TOKEN" == *"--token"* ]]; then
+        TOKEN=$(echo "$INPUT_TOKEN" | sed -E 's/.*--token[= ]+([^ ]+).*/\1/')
+    else
+        TOKEN="$INPUT_TOKEN"
+    fi
+
+    TOKEN=$(echo "$TOKEN" | tr -d '"' | tr -d "'")
+
+    if [ -z "$TOKEN" ]; then
+        echo "Token 提取失败"
         exit 1
     fi
 }
 
+#####################################
+清理旧服务() {
+
+echo "检测并清理旧隧道服务..."
+
+for svc in suoha-http2 suoha-quic suoha-xray; do
+    systemctl stop $svc 2>/dev/null || true
+    systemctl disable $svc 2>/dev/null || true
+    rm -f $SYSTEMD_DIR/$svc.service
+done
+
+systemctl daemon-reload 2>/dev/null || true
+}
+
+#####################################
 安装依赖() {
     $PM_UPDATE
     $PM_INSTALL curl unzip uuidgen 2>/dev/null || $PM_INSTALL uuid-runtime || true
 }
 
+#####################################
 安装Xray() {
     mkdir -p $BIN_DIR
     ARCH_SUFFIX=$(检测架构)
@@ -94,12 +123,14 @@ ARCH=$(uname -m)
     chmod +x $BIN_DIR/xray
 }
 
+#####################################
 安装Cloudflared() {
     mkdir -p $BIN_DIR
     curl -L -o $BIN_DIR/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
     chmod +x $BIN_DIR/cloudflared
 }
 
+#####################################
 生成UUID() { uuidgen; }
 
 生成端口() {
@@ -109,6 +140,7 @@ ARCH=$(uname -m)
     done
 }
 
+#####################################
 生成Xray配置() {
     mkdir -p $CONF_DIR
     生成端口
@@ -134,45 +166,10 @@ cat > $CONF_DIR/xray.json <<EOF
 EOF
 }
 
-创建systemd() {
+#####################################
+创建服务() {
 
 MODE=$1
-
-if [ "$MODE" = "http2" ] || [ "$MODE" = "both" ]; then
-cat > $SYSTEMD_DIR/suoha-http2.service <<EOF
-[Unit]
-Description=Suoha Tunnel HTTP2
-After=network.target
-
-[Service]
-ExecStart=$BIN_DIR/cloudflared tunnel --protocol http2 --edge-ip-version $EDGE_IP_VERSION run --token $TOKEN
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl enable suoha-http2
-systemctl start suoha-http2
-fi
-
-if [ "$MODE" = "quic" ] || [ "$MODE" = "both" ]; then
-cat > $SYSTEMD_DIR/suoha-quic.service <<EOF
-[Unit]
-Description=Suoha Tunnel QUIC
-After=network.target
-
-[Service]
-ExecStart=$BIN_DIR/cloudflared tunnel --protocol quic --edge-ip-version $EDGE_IP_VERSION run --token $TOKEN
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl enable suoha-quic
-systemctl start suoha-quic
-fi
 
 cat > $SYSTEMD_DIR/suoha-xray.service <<EOF
 [Unit]
@@ -187,23 +184,58 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
+if [ "$MODE" = "http2" ] || [ "$MODE" = "both" ]; then
+cat > $SYSTEMD_DIR/suoha-http2.service <<EOF
+[Unit]
+Description=Suoha Tunnel HTTP2
+After=network.target
+
+[Service]
+ExecStart=$BIN_DIR/cloudflared tunnel --protocol http2 --edge-ip-version $EDGE_IP_VERSION run --token $TOKEN
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
+if [ "$MODE" = "quic" ] || [ "$MODE" = "both" ]; then
+cat > $SYSTEMD_DIR/suoha-quic.service <<EOF
+[Unit]
+Description=Suoha Tunnel QUIC
+After=network.target
+
+[Service]
+ExecStart=$BIN_DIR/cloudflared tunnel --protocol quic --edge-ip-version $EDGE_IP_VERSION run --token $TOKEN
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
 systemctl daemon-reload
 systemctl enable suoha-xray
 systemctl start suoha-xray
+
+[ -f "$SYSTEMD_DIR/suoha-http2.service" ] && systemctl enable suoha-http2 && systemctl start suoha-http2
+[ -f "$SYSTEMD_DIR/suoha-quic.service" ] && systemctl enable suoha-quic && systemctl start suoha-quic
 }
 
-显示信息() {
-echo ""
-echo "========== 节点信息 =========="
-echo "优选域名: $CF_PREFERRED_DOMAIN"
-echo "vless://$UUID@$CF_PREFERRED_DOMAIN:443?encryption=none&security=tls&type=grpc&serviceName=grpc#$CF_PREFERRED_DOMAIN"
-echo "================================"
+#####################################
+完全卸载() {
+清理旧服务
+rm -rf $BASE_DIR
+echo "已完全卸载"
 }
 
+#####################################
 安装流程() {
-read -p "请输入 Tunnel Token: " TOKEN
+
 检测系统
+提取Token
 检测IP协议
+清理旧服务
 安装依赖
 安装Xray
 安装Cloudflared
@@ -212,29 +244,36 @@ read -p "请输入 Tunnel Token: " TOKEN
 echo "选择隧道模式："
 echo "1. 仅 HTTP/2"
 echo "2. 仅 QUIC"
-echo "3. HTTP/2 + QUIC 同时运行"
+echo "3. 双隧道"
 read -p "选择: " MODE_CHOICE
 
 case $MODE_CHOICE in
-1) 创建systemd http2 ;;
-2) 创建systemd quic ;;
-3) 创建systemd both ;;
+1) 创建服务 http2 ;;
+2) 创建服务 quic ;;
+3) 创建服务 both ;;
 *) echo "选择错误"; exit 1 ;;
 esac
 
-显示信息
+echo ""
+echo "========== 节点信息 =========="
+echo "优选域名: $CF_PREFERRED_DOMAIN"
+echo "vless://$UUID@$CF_PREFERRED_DOMAIN:443?encryption=none&security=tls&type=grpc&serviceName=grpc#$CF_PREFERRED_DOMAIN"
+echo "================================"
 }
 
+#####################################
 菜单() {
 while true; do
 echo ""
 echo "========= SUOHA $VERSION ========="
-echo "1. 安装/切换隧道模式"
+echo "1. 安装 / 切换模式"
+echo "2. 完全卸载"
 echo "0. 退出"
-read -p "选择: " NUM
+read -p "请选择: " NUM
 
 case $NUM in
 1) 安装流程 ;;
+2) 完全卸载 ;;
 0) exit ;;
 esac
 done
